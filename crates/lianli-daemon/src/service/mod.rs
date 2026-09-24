@@ -93,6 +93,37 @@ fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
 }
 
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Coalesces slow polls so they cannot build a backlog ahead of IPC events.
+struct PollGate(AtomicBool);
+
+impl PollGate {
+    const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    fn try_queue(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    fn dequeued(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+static DEVICE_POLL_GATE: PollGate = PollGate::new();
+
+fn queue_startup_events(
+    tx: &std::sync::mpsc::Sender<DaemonEvent>,
+    gate: &PollGate,
+) -> Result<(), std::sync::mpsc::SendError<DaemonEvent>> {
+    tx.send(DaemonEvent::USBCheck)?;
+    if gate.try_queue() {
+        tx.send(DaemonEvent::DevicePoll)?;
+    }
+    Ok(())
+}
+
 /// Full USB bus enumeration interval — only needed for hot-plug detection of
 /// wired USB devices (LCD, AIO, etc.). Wireless discovery uses its own RX polling.
 const USB_ENUM_INTERVAL: Duration = Duration::from_secs(10);
@@ -562,8 +593,7 @@ impl ServiceManager {
 
         self.tx = Some(tx.clone());
 
-        tx.send(DaemonEvent::USBCheck).ok();
-        tx.send(DaemonEvent::DevicePoll).ok();
+        queue_startup_events(&tx, &DEVICE_POLL_GATE)?;
 
         self.initialize_runtime(tx.clone(), signals);
         drop(startup);
@@ -586,6 +616,9 @@ impl ServiceManager {
         let device_tx = tx.clone();
         thread::spawn(move || loop {
             thread::sleep(DEVICE_POLL_INTERVAL);
+            if !DEVICE_POLL_GATE.try_queue() {
+                continue;
+            }
             if device_tx.send(DaemonEvent::DevicePoll).is_err() {
                 break;
             }
@@ -718,6 +751,7 @@ impl ServiceManager {
                     }
                 }
                 DaemonEvent::DevicePoll => {
+                    DEVICE_POLL_GATE.dequeued();
                     self.poll_startup_image();
                     self.refresh_after_mode_switch();
                     self.check_pixel_clean_sessions();
@@ -1066,5 +1100,58 @@ impl ServiceManager {
         stream_worker.stop();
         self.shutdown();
         Ok(self.restart_requested && !signals.requested())
+    }
+}
+
+#[cfg(test)]
+mod poll_gate_tests {
+    use super::{queue_startup_events, DaemonEvent, PollGate};
+
+    #[test]
+    fn slow_startup_keeps_one_poll_ahead_of_ipc() {
+        let gate = PollGate::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        queue_startup_events(&tx, &gate).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(DaemonEvent::USBCheck)));
+
+        for _ in 0..3 {
+            if gate.try_queue() {
+                tx.send(DaemonEvent::DevicePoll).unwrap();
+            }
+        }
+        assert!(matches!(rx.try_recv(), Ok(DaemonEvent::DevicePoll)));
+        gate.dequeued();
+        tx.send(DaemonEvent::IpcUpdate).unwrap();
+
+        for _ in 0..3 {
+            if gate.try_queue() {
+                tx.send(DaemonEvent::DevicePoll).unwrap();
+            }
+        }
+        assert!(matches!(rx.try_recv(), Ok(DaemonEvent::IpcUpdate)));
+        assert!(matches!(rx.try_recv(), Ok(DaemonEvent::DevicePoll)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn slow_polls_never_queue_more_than_one_event() {
+        // The producer ticks every interval; each poll takes two intervals.
+        let gate = PollGate::new();
+        let mut queued = 0usize;
+        let mut peak = 0usize;
+        for tick in 0..100 {
+            if gate.try_queue() {
+                queued += 1;
+            }
+            peak = peak.max(queued);
+            if tick % 2 == 1 && queued > 0 {
+                queued -= 1;
+                gate.dequeued();
+            }
+        }
+        assert_eq!(peak, 1);
     }
 }
