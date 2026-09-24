@@ -8,13 +8,66 @@ use anyhow::{Context, Result};
 use lianli_shared::rgb::{
     RgbEffect, RgbMode, RgbPlaybackTiming, RgbRenderFamily, RgbRenderProfile, RgbZoneInfo,
 };
-use lianli_transport::usb::{RusbBulk, LCD_READ_TIMEOUT, LCD_WRITE_TIMEOUT};
+use lianli_transport::usb::{RusbBulk, EP_IN, LCD_WRITE_TIMEOUT, SHUTTING_DOWN};
+use lianli_transport::TransportError;
 use parking_lot::Mutex;
 use rusb::{Device, GlobalContext};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::{debug, info};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 const PACKET_SIZE: usize = 8;
+
+// Replies exceed the 8-byte commands; receive a full 64-byte endpoint packet.
+const REPLY_SIZE: usize = 64;
+const REPLY_TIMEOUT: Duration = Duration::from_millis(200);
+const HALT_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct HaltRecovery {
+    last_attempt: Option<Instant>,
+}
+
+impl HaltRecovery {
+    fn should_attempt(&mut self, error: &TransportError, now: Instant, stopping: bool) -> bool {
+        if stopping || !matches!(error, TransportError::Usb(rusb::Error::Pipe)) {
+            return false;
+        }
+        if self
+            .last_attempt
+            .is_some_and(|last| now.duration_since(last) < HALT_RECOVERY_INTERVAL)
+        {
+            return false;
+        }
+        self.last_attempt = Some(now);
+        true
+    }
+}
+
+struct LedIo {
+    transport: RusbBulk,
+    recovery: HaltRecovery,
+}
+
+impl LedIo {
+    fn read_reply(&mut self, rx: &mut [u8; REPLY_SIZE]) -> Result<usize, TransportError> {
+        let result = self.transport.read(rx, REPLY_TIMEOUT);
+        if let Err(error) = &result {
+            if self.recovery.should_attempt(
+                error,
+                Instant::now(),
+                SHUTTING_DOWN.load(Ordering::Relaxed),
+            ) {
+                // Halt clearing can block independently of REPLY_TIMEOUT; throttle even failed attempts.
+                if let Err(error) = self.transport.clear_halt(EP_IN) {
+                    warn!(%error, "HS2 OLED LED: IN endpoint halt recovery failed");
+                }
+            }
+        }
+        result
+    }
+}
 
 // Opcodes
 const CMD_GET_VER: u8 = 0x10;
@@ -77,7 +130,7 @@ fn rpm_to_output(rpm: u16) -> u16 {
 }
 
 pub struct Hs2OledLedController {
-    transport: Mutex<RusbBulk>,
+    io: Mutex<LedIo>,
     firmware: Mutex<Option<String>>,
     pump_source: Mutex<Option<bool>>,
 }
@@ -91,17 +144,20 @@ impl Hs2OledLedController {
             .context("configuring HS2 OLED Curve LED MCU")?;
         info!("HS2 OLED Curve LED MCU opened");
         Ok(Self {
-            transport: Mutex::new(transport),
+            io: Mutex::new(LedIo {
+                transport,
+                recovery: HaltRecovery::default(),
+            }),
             firmware: Mutex::new(None),
             pump_source: Mutex::new(None),
         })
     }
 
-    fn send_and_read(&self, tx: &[u8; PACKET_SIZE]) -> Result<[u8; PACKET_SIZE]> {
-        let transport = self.transport.lock();
-        transport.write_full(tx, LCD_WRITE_TIMEOUT)?;
-        let mut rx = [0u8; PACKET_SIZE];
-        let result = transport.read(&mut rx, LCD_READ_TIMEOUT);
+    fn send_and_read(&self, tx: &[u8; PACKET_SIZE]) -> Result<[u8; REPLY_SIZE]> {
+        let mut io = self.io.lock();
+        io.transport.write_full(tx, LCD_WRITE_TIMEOUT)?;
+        let mut rx = [0u8; REPLY_SIZE];
+        let result = io.read_reply(&mut rx);
         if matches!(tx[0], CMD_GET_VER | CMD_GET_TEMP | CMD_GET_PUMP) {
             let len = result.context("HS2 OLED telemetry read")?;
             anyhow::ensure!(len >= 3, "short HS2 OLED telemetry response");
@@ -221,13 +277,14 @@ impl Hs2OledLedController {
     }
 
     fn send_rgb_packets(&self, packets: [[u8; RGB_PACKET_SIZE]; 3]) -> Result<()> {
-        let transport = self.transport.lock();
+        let mut io = self.io.lock();
         for (chunk, packet) in packets.iter().enumerate() {
-            transport
+            io.transport
                 .write(packet, LCD_WRITE_TIMEOUT)
                 .with_context(|| format!("HS2 OLED LED: write RGB chunk {chunk}"))?;
-            let mut rx = [0u8; PACKET_SIZE];
-            let _ = transport.read(&mut rx, LCD_READ_TIMEOUT);
+            let mut rx = [0u8; REPLY_SIZE];
+            // The vendor does not define acknowledgement fields for writes.
+            let _ = io.read_reply(&mut rx);
         }
         Ok(())
     }
@@ -464,7 +521,54 @@ impl crate::registry::DeviceDriver for Hs2OledLedDriver {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_rgb_packets, pump_source_packet, rpm_to_output, CMD_PUSH_RGB};
+    use super::{
+        build_rgb_packets, pump_source_packet, rpm_to_output, HaltRecovery, CMD_PUSH_RGB,
+        HALT_RECOVERY_INTERVAL,
+    };
+    use lianli_transport::TransportError;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn halt_recovery_ignores_nonstall_errors() {
+        let now = Instant::now();
+        let mut recovery = HaltRecovery::default();
+        for error in [
+            rusb::Error::Timeout,
+            rusb::Error::Interrupted,
+            rusb::Error::NoDevice,
+            rusb::Error::Overflow,
+            rusb::Error::Io,
+        ] {
+            assert!(!recovery.should_attempt(&TransportError::Usb(error), now, false));
+        }
+        assert!(recovery.should_attempt(&TransportError::Usb(rusb::Error::Pipe), now, false));
+    }
+
+    #[test]
+    fn halt_recovery_skips_shutdown() {
+        let now = Instant::now();
+        let mut recovery = HaltRecovery::default();
+        let error = TransportError::Usb(rusb::Error::Pipe);
+        assert!(!recovery.should_attempt(&error, now, true));
+        assert!(recovery.should_attempt(&error, now, false));
+        assert!(!recovery.should_attempt(&error, now + HALT_RECOVERY_INTERVAL, true));
+    }
+
+    #[test]
+    fn halt_recovery_throttles_attempts_without_requiring_success() {
+        let now = Instant::now();
+        let mut recovery = HaltRecovery::default();
+        let error = TransportError::Usb(rusb::Error::Pipe);
+        assert!(recovery.should_attempt(&error, now, false));
+        assert!(!recovery.should_attempt(&error, now, false));
+        assert!(!recovery.should_attempt(
+            &error,
+            now + HALT_RECOVERY_INTERVAL - Duration::from_millis(1),
+            false,
+        ));
+        assert!(recovery.should_attempt(&error, now + HALT_RECOVERY_INTERVAL, false));
+        assert!(!recovery.should_attempt(&error, now + HALT_RECOVERY_INTERVAL, false));
+    }
 
     #[test]
     fn pump_source_uses_inverted_oled_selector() {
