@@ -3,6 +3,13 @@
 Generated from git history by git-cliff (see .github/cliff.toml).
 Regenerate rather than editing by hand.
 
+## v1.1.3 — 2026-09-24
+
+### Fixes
+- **daemon**: Bound queued device polls so IPC events are not starved  ([#220](https://github.com/sgtaziz/lian-li-linux/pull/220))
+- **hydroshift**: Read full-size replies from the OLED Curve LED MCU  ([#223](https://github.com/sgtaziz/lian-li-linux/pull/223))
+- **lcd**: Recover missing fan LCD groups (fixes [#221](https://github.com/sgtaziz/lian-li-linux/issues/221))
+
 ## v1.1.2 — 2026-09-21
 
 ### Fixes
