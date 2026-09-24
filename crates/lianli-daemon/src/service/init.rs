@@ -220,7 +220,7 @@ impl ServiceManager {
     }
 
     pub(super) fn check_wired_hotplug(&mut self) {
-        if self.startup_image_job.is_some() {
+        if self.startup_image_job.is_some() || self.lcd_group_recovery.busy() {
             return;
         }
         let (current_ids, current_topos) = match self.snapshot_wired() {
@@ -346,6 +346,9 @@ impl ServiceManager {
     /// in which case the topology baseline is left untouched so a later
     /// poll retries.
     pub(super) fn init_wired_devices(&mut self) -> bool {
+        if self.lcd_group_recovery.busy() {
+            return false;
+        }
         self.registry.open_workers.reap_finished();
         if lianli_transport::usb::SHUTTING_DOWN.load(Ordering::Relaxed) {
             return false;

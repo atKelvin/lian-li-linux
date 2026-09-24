@@ -33,6 +33,7 @@ impl ServiceManager {
                 self.reconcile_startup_quarantine(&present);
                 self.refresh_tl_lcd_port_index_cache(&usb_devices);
                 self.build_usb_device_cache(usb_devices);
+                self.recover_lcd_groups();
             }
             Err(e) => {
                 warn!("USB enumeration failed: {e}");

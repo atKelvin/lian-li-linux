@@ -206,7 +206,9 @@ impl ServiceManager {
         permit: Option<Arc<lianli_control::write_gate::ServiceWritePermit>>,
     ) -> Result<()> {
         ensure!(
-            self.startup_image_job.is_none() && self.display_switch.is_none(),
+            self.startup_image_job.is_none()
+                && self.display_switch.is_none()
+                && !self.lcd_group_recovery.busy(),
             "Another LCD operation is running"
         );
         ensure!(

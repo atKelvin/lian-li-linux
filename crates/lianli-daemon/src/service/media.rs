@@ -267,7 +267,7 @@ impl ServiceManager {
     }
 
     pub(super) fn refresh_targets(&mut self) {
-        if self.startup_image_job.is_some() {
+        if self.startup_image_job.is_some() || self.lcd_group_recovery.busy() {
             return;
         }
         if self.config.as_ref().is_none_or(|cfg| cfg.lcds.is_empty())

@@ -128,6 +128,9 @@ impl ServiceManager {
         target_id: Option<String>,
         minutes: u16,
     ) -> Result<u64, String> {
+        if self.lcd_group_recovery.busy() {
+            return Err("LCD group recovery is still running".into());
+        }
         if self.startup_image_job.is_some() {
             return Err("Startup image upload is still running".into());
         }

@@ -46,6 +46,34 @@ pub struct DiscoveredDevice {
 }
 
 impl DiscoveredDevice {
+    pub fn lcd_group_size(&self) -> Option<u8> {
+        if self.device_type != 0 || !(1..=4).contains(&self.fan_count) {
+            return None;
+        }
+        let family = match self.fan_type {
+            WirelessFanType::Slv3Led | WirelessFanType::Slv3Lcd => 20..=26,
+            WirelessFanType::Tlv2Led | WirelessFanType::Tlv2Lcd => 27..=35,
+            WirelessFanType::SlInfV3 { .. } => 43..=50,
+            WirelessFanType::TlV3 { .. } => 51..=58,
+            _ => return None,
+        };
+        let mut count = 0;
+        for &kind in &self.fan_types[..usize::from(self.fan_count)] {
+            if !family.contains(&kind) {
+                return None;
+            }
+            match WirelessFanType::from_fan_type_byte(kind) {
+                WirelessFanType::Unknown => return None,
+                WirelessFanType::Slv3Lcd
+                | WirelessFanType::Tlv2Lcd
+                | WirelessFanType::SlInfV3 { lcd: true }
+                | WirelessFanType::TlV3 { lcd: true } => count += 1,
+                _ => {}
+            }
+        }
+        Some(count)
+    }
+
     pub fn mac_str(&self) -> String {
         format!(
             "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -713,6 +741,33 @@ fn rebuild_published_vec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lcd_group_count_uses_each_reported_slot_and_rejects_unknown_data() {
+        let mut device = rec([1; 6], [2; 6]);
+        for (types, count) in [
+            ([23, 20, 26, 0], 2),
+            ([27, 28, 35, 0], 2),
+            ([43, 45, 48, 0], 2),
+            ([51, 53, 56, 0], 2),
+            ([20, 21, 22, 0], 0),
+        ] {
+            device.fan_types = types;
+            device.fan_type = WirelessFanType::from_fan_type_byte(types[0]);
+            assert_eq!(device.lcd_group_size(), Some(count));
+        }
+        device.fan_type = WirelessFanType::TlV3 { lcd: true };
+        device.fan_types = [51, 23, 56, 0];
+        assert_eq!(device.lcd_group_size(), None);
+        device.fan_types = [51, 0, 56, 0];
+        assert_eq!(device.lcd_group_size(), None);
+        device.fan_types = [51; 4];
+        device.fan_count = 5;
+        assert_eq!(device.lcd_group_size(), None);
+        device.fan_count = 3;
+        device.device_type = 10;
+        assert_eq!(device.lcd_group_size(), None);
+    }
 
     fn rec(mac: [u8; 6], master: [u8; 6]) -> DiscoveredDevice {
         DiscoveredDevice {

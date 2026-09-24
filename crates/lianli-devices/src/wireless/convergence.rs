@@ -1,6 +1,8 @@
 use super::controller::WirelessController;
 use super::discovery::{DeviceHealthMap, DiscoveredDevice, ACK_FRESHNESS};
-use super::transport::{with_transport_recovery, RecoveryBackoff, SharedTransport};
+use super::transport::{
+    with_ready_transport, with_transport_recovery, RecoveryBackoff, SharedTransport,
+};
 use super::{RF_CHUNKS, RF_CHUNK_SIZE, RF_DATA_SIZE, USB_CMD_SEND_RF};
 use anyhow::{ensure, Context, Result};
 use lianli_transport::usb::{RusbBulk, USB_TIMEOUT};
@@ -71,6 +73,17 @@ impl WirelessController {
         ack: AckSignal,
         description: impl Into<String>,
     ) -> Result<()> {
+        self.enqueue_rf_command_with_retry_limit(device, rf_data, ack, description, INITIAL_RETRIES)
+    }
+
+    pub(super) fn enqueue_rf_command_with_retry_limit(
+        &self,
+        device: &DiscoveredDevice,
+        rf_data: Vec<u8>,
+        ack: AckSignal,
+        description: impl Into<String>,
+        retries: u32,
+    ) -> Result<()> {
         let _order = self.command_order.lock();
         ensure!(
             !matches!(ack, AckSignal::CmdSeq(_)) || *self.picture_target.lock() != Some(device.mac),
@@ -99,13 +112,31 @@ impl WirelessController {
             rx_type: device.rx_type,
             rf_data,
             ack,
-            remaining_retries: INITIAL_RETRIES,
+            remaining_retries: retries,
             last_sent: Instant::now(),
             queued_at: Instant::now(),
             description: description.into(),
         };
 
         admit_command(&mut queue.lock(), cmd.clone())?;
+        if retries == 0 {
+            return with_ready_transport(
+                self.tx.as_ref().context("wireless TX is unavailable")?,
+                &super::TX_IDS,
+                "TX",
+                &self.poll_stop,
+                |handle| {
+                    ensure!(
+                        !lianli_transport::usb::shutting_down(),
+                        "daemon is stopping"
+                    );
+                    // Complete all RF fragments once a non-replayable command starts.
+                    lianli_transport::usb::with_teardown_io(Duration::from_secs(2), || {
+                        send_rf_frame(handle, &cmd.channel, &cmd.rx_type, &cmd.rf_data)
+                    })
+                },
+            );
+        }
         if let Err(e) = self.send_command_once(&cmd) {
             warn!("initial send failed for {}: {e:#}", cmd.mac_str());
         }

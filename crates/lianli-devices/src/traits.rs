@@ -143,6 +143,14 @@ pub trait FanDevice: Send + Sync {
 
     fn set_software_cooling_active(&self, _active: bool) {}
 
+    fn lcd_group_size(&self) -> Option<u8> {
+        None
+    }
+
+    fn reboot_lcd_group(&self, _stop: &AtomicBool) -> Result<()> {
+        anyhow::bail!("This controller does not support wired LCD recovery")
+    }
+
     fn set_lcd_startup_theme_enabled(
         &self,
         _physical_slot: u8,
@@ -233,6 +241,14 @@ impl<T: FanDevice + ?Sized> FanDevice for Arc<T> {
     }
     fn set_software_cooling_active(&self, active: bool) {
         (**self).set_software_cooling_active(active)
+    }
+
+    fn lcd_group_size(&self) -> Option<u8> {
+        (**self).lcd_group_size()
+    }
+
+    fn reboot_lcd_group(&self, stop: &AtomicBool) -> Result<()> {
+        (**self).reboot_lcd_group(stop)
     }
 
     fn set_lcd_startup_theme_enabled(

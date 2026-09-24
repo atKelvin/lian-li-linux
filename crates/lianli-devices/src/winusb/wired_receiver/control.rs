@@ -88,14 +88,29 @@ impl WiredReceiverController {
     }
 
     /// RebootLcd (0x17) — reboot the wired LCD group.
-    pub fn reboot_lcd(&self) -> Result<()> {
+    pub fn reboot_lcd(&self, stop: &AtomicBool) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.pid, 0x0102 | 0x0104),
+            "LCD recovery requires a Flex LCD receiver"
+        );
+        crate::startup_image::ensure_not_cancelled(stop)?;
+        let transport = self
+            .transport
+            .try_lock_for(Duration::from_millis(100))
+            .context("Flex receiver is busy")?;
+        crate::startup_image::ensure_not_cancelled(stop)?;
         let mut tx = [0u8; PACKET_SIZE];
         tx[0] = CMD_REBOOT_LCD;
-        let rx = self.send_and_read(&tx)?;
-        if rx[0] != CMD_REBOOT_LCD && rx[0] != CMD_SAVE_OR_CLEAR {
-            warn!("RebootLcd unexpected response: 0x{:02x}", rx[0]);
-        }
-        Ok(())
+        // Finish the command acknowledgement even if shutdown starts after the write.
+        lianli_transport::usb::with_teardown_io(Duration::from_secs(2), || {
+            anyhow::ensure!(
+                transport.write(&tx, LCD_WRITE_TIMEOUT)? == PACKET_SIZE,
+                "Short Flex LCD reboot command"
+            );
+            let mut rx = [0; PACKET_SIZE];
+            let length = transport.read(&mut rx, LCD_READ_TIMEOUT)?;
+            validate_reboot_ack(&rx[..length])
+        })
     }
 
     /// FanAndFixedData (0x26) — per-fan theme/data/brightness push.
@@ -156,6 +171,14 @@ impl WiredReceiverController {
 }
 
 impl FanDevice for WiredReceiverController {
+    fn lcd_group_size(&self) -> Option<u8> {
+        self.lcd_count
+    }
+
+    fn reboot_lcd_group(&self, stop: &AtomicBool) -> Result<()> {
+        self.reboot_lcd(stop)
+    }
+
     fn set_lcd_startup_theme_enabled(
         &self,
         physical_slot: u8,
@@ -291,6 +314,19 @@ fn startup_theme_mask(status: &[u8], slot: u8, enabled: bool) -> Result<u8> {
     })
 }
 
+fn validate_reboot_ack(response: &[u8]) -> Result<()> {
+    // L-Connect accepts 0x15; TL Flex firmware also acknowledges with 0x17.
+    anyhow::ensure!(
+        matches!(
+            response.first(),
+            Some(&CMD_REBOOT_LCD) | Some(&CMD_SAVE_OR_CLEAR)
+        ),
+        "Unexpected Flex LCD reboot acknowledgement: {:02x?}",
+        response
+    );
+    Ok(())
+}
+
 fn validate_pwm_ack(response: &[u8]) -> Result<()> {
     anyhow::ensure!(
         response.len() >= 2 && response[0] == CMD_SET_FANS_PWM && response[1] == 0,
@@ -336,6 +372,29 @@ fn reverse_fan_slots<T: Copy>(slots: &mut [T; 4], fan_count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flex_lcd_types_exclude_plain_fans_and_unknown_status() {
+        assert_eq!(flex_lcd_count(0x0102, 4, &[51, 52, 55, 56]), Some(4));
+        assert_eq!(flex_lcd_count(0x0102, 4, &[53, 54, 57, 58]), Some(0));
+        assert_eq!(flex_lcd_count(0x0102, 3, &[51, 53, 56, 0]), Some(2));
+        assert_eq!(flex_lcd_count(0x0104, 4, &[43, 44, 47, 48]), Some(4));
+        assert_eq!(flex_lcd_count(0x0104, 4, &[45, 46, 49, 50]), Some(0));
+        assert_eq!(flex_lcd_count(0x0102, 0, &[0; 4]), Some(0));
+        assert_eq!(flex_lcd_count(0x0102, 2, &[51, 0, 0, 0]), None);
+        assert_eq!(flex_lcd_count(0x0102, 5, &[51; 4]), None);
+        assert_eq!(flex_lcd_count(0x0101, 1, &[51; 4]), None);
+        assert_eq!(flex_lcd_count(0x0102, 1, &[43; 4]), None);
+    }
+
+    #[test]
+    fn reboot_ack_accepts_vendor_and_observed_firmware_responses() {
+        assert!(validate_reboot_ack(&[0x15]).is_ok());
+        assert!(validate_reboot_ack(&[0x17]).is_ok());
+        assert!(validate_reboot_ack(&[]).is_err());
+        assert!(validate_reboot_ack(&[0x12]).is_err());
+        assert!(validate_reboot_ack(&[0]).is_err());
+    }
 
     #[test]
     fn startup_selection_preserves_sibling_bits_in_physical_order() {

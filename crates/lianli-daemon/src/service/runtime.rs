@@ -951,7 +951,7 @@ impl ThreadedWinUsbSender {
         }
     }
 
-    fn join_before(&mut self, deadline: std::time::Instant) {
+    fn join_before(&mut self, deadline: std::time::Instant) -> bool {
         if let Some(worker) = self.thread.take() {
             while !worker.is_finished() && std::time::Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
@@ -959,12 +959,15 @@ impl ThreadedWinUsbSender {
             if worker.is_finished() {
                 if worker.join().is_err() {
                     warn!("LCD sender panicked");
+                    return false;
                 }
             } else {
                 // The worker retains its transport until the current I/O returns.
                 warn!("LCD sender did not stop before deadline; detaching");
+                return false;
             }
         }
+        true
     }
 
     fn shutdown(&mut self) -> anyhow::Result<()> {
@@ -978,7 +981,10 @@ impl ThreadedWinUsbSender {
                 rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                     .map_err(|_| anyhow::anyhow!("LCD shutdown acknowledgement timed out"))?
             });
-        self.join_before(deadline);
+        anyhow::ensure!(
+            self.join_before(deadline),
+            "LCD sender did not finish shutdown"
+        );
         result
     }
 

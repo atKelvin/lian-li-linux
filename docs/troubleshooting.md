@@ -406,6 +406,19 @@ processes. Closing the dialog without choosing a file cancels saving.
 
 ## Devices or LCD media are missing
 
+For TL and SL-INF Flex receivers, and wireless SL, TL, TL Flex and SL-INF Flex
+fan LCD groups, the daemon automatically attempts recovery when fewer LCD USB
+devices appear than the receiver reports. This includes completely missing groups.
+Recovery requires an unambiguous USB hub mapping; wireless groups also need their
+USB companion's MAC address to match a bound receiver.
+
+The existing USB scan runs every ten seconds. After a ten-second discovery grace,
+the daemon stops playback on that group, sends its LCD reboot command and allows
+six seconds for rediscovery. A group gets at most two attempts while its receiver
+remains connected, at least thirty seconds apart. Other groups keep playing.
+If the group remains incomplete, check USB and power connections and power-cycle
+it. Recovery does not reset the USB hub or change wireless binding.
+
 **Hardware owner unreachable** means a process holds the hardware lock but the
 GUI cannot reach daemon IPC. Wait for startup or a service switch to finish, then
 Recheck. If it persists, inspect daemon logs and runtime socket visibility.

@@ -72,6 +72,7 @@ pub struct WiredReceiverController {
     params: ReceiverParams,
     render_family: RgbRenderFamily,
     fan_count: Mutex<u8>,
+    lcd_count: Option<u8>,
     fan_pwm: Mutex<Option<[u8; 4]>>,
     /// True when this receiver chains right-to-left (SL-INF daisy-chain with
     /// `fan_num >= 10`). Per-fan PWM/RGB ordering must be reversed on send.
@@ -107,12 +108,13 @@ impl WiredReceiverController {
 
         info!("{} opened", params.name);
 
-        let ctrl = Self {
+        let mut ctrl = Self {
             transport: Mutex::new(transport),
             pid,
             params,
             render_family,
             fan_count: Mutex::new(4),
+            lcd_count: None,
             fan_pwm: Mutex::new(None),
             is_inf_right_attach: Mutex::new(false),
             firmware: Mutex::new(None),
@@ -125,6 +127,9 @@ impl WiredReceiverController {
         };
 
         if let Ok(status) = ctrl.get_info() {
+            if status.dev_type == 0 {
+                ctrl.lcd_count = flex_lcd_count(pid, status.fan_count, &status.fans_type);
+            }
             *ctrl.fan_count.lock() = status.fan_count.clamp(1, 4);
             *ctrl.is_inf_right_attach.lock() = status.is_inf_right_attach;
             if !status.mac.iter().all(|&b| b == 0) {
@@ -236,6 +241,19 @@ impl WiredReceiverController {
         let fw = String::from_utf8_lossy(&fw_bytes[..end]).trim().to_string();
         Ok(fw)
     }
+}
+
+fn flex_lcd_count(pid: u16, fan_count: u8, fan_types: &[u8; 4]) -> Option<u8> {
+    let (known, lcd_types) = match pid {
+        0x0102 => (51..=58, [51, 52, 55, 56]),
+        0x0104 => (43..=50, [43, 44, 47, 48]),
+        _ => return None,
+    };
+    let types = fan_types.get(..usize::from(fan_count))?;
+    if types.iter().any(|kind| !known.contains(kind)) {
+        return None;
+    }
+    Some(types.iter().filter(|kind| lcd_types.contains(kind)).count() as u8)
 }
 
 fn validate_response_length(response: &[u8], command: u8) -> Result<()> {

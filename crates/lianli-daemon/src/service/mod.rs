@@ -19,6 +19,7 @@ use runtime::LcdBackend;
 mod aio_lcd_firmware;
 mod display_mode;
 mod init;
+mod lcd_group_recovery;
 mod lifecycle_monitor;
 mod media;
 mod media_preparation;
@@ -274,6 +275,7 @@ pub struct ServiceManager {
     startup_image_quarantine: HashSet<String>,
     startup_absent_since: HashMap<String, Instant>,
     cleaner_reload_pending: bool,
+    lcd_group_recovery: lcd_group_recovery::LcdGroupRecovery,
 }
 
 impl ServiceManager {
@@ -340,6 +342,7 @@ impl ServiceManager {
             startup_image_quarantine,
             startup_absent_since: HashMap::new(),
             cleaner_reload_pending: false,
+            lcd_group_recovery: Default::default(),
         })
     }
 
@@ -405,6 +408,7 @@ impl ServiceManager {
     }
 
     pub fn device_poll(&mut self) {
+        self.lcd_group_recovery.poll();
         self.poll_prepared_media();
         if self.cleaner_reload_pending {
             if let Some(tx) = &self.tx {

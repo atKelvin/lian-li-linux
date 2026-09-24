@@ -102,6 +102,19 @@ impl WirelessController {
     }
 
     pub fn reboot_lcd_group(&self, mac: &[u8; 6]) -> Result<()> {
+        self.queue_lcd_reboot(mac, false)
+    }
+
+    /// Automatic recovery owns its retry budget and must not reboot restored playback later.
+    pub fn reboot_lcd_group_once(&self, mac: &[u8; 6]) -> Result<()> {
+        anyhow::ensure!(
+            self.devices().iter().any(|device| device.mac == *mac),
+            "LCD group is no longer bound to this controller"
+        );
+        self.queue_lcd_reboot(mac, true)
+    }
+
+    fn queue_lcd_reboot(&self, mac: &[u8; 6], once: bool) -> Result<()> {
         let device = self
             .device_by_mac(mac)
             .context("device not found for LCD reboot")?;
@@ -118,12 +131,22 @@ impl WirelessController {
         rf_data[15] = master_ch;
         rf_data[17] = target_cmd_seq;
 
-        self.enqueue_rf_command(
-            &device,
-            rf_data,
-            AckSignal::CmdSeq(target_cmd_seq),
-            "LCD reboot".to_string(),
-        )?;
+        if once {
+            self.enqueue_rf_command_with_retry_limit(
+                &device,
+                rf_data,
+                AckSignal::CmdSeq(target_cmd_seq),
+                "LCD reboot",
+                0,
+            )?;
+        } else {
+            self.enqueue_rf_command(
+                &device,
+                rf_data,
+                AckSignal::CmdSeq(target_cmd_seq),
+                "LCD reboot",
+            )?;
+        }
 
         debug!("LCD reboot: {}", device.mac_str());
         Ok(())
