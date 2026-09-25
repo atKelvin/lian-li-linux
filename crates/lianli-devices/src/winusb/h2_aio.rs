@@ -199,7 +199,7 @@ impl H2AioController {
             // the bulk mutex, the same mutex stream_begin holds while
             // flipping it, so a stream beginning in between is caught
             // before any byte reaches the pipe.
-            if self.write_control(label, &packet, reply_wait)? {
+            if self.write_control(label, &packet)? {
                 return Ok(true);
             }
         }
@@ -227,7 +227,7 @@ impl H2AioController {
     /// across both halves so no other command's answer is consumed here.
     /// Returns false, nothing written, when a stream began while waiting
     /// for the transport, so the caller must queue the command instead.
-    fn write_control(&self, label: &str, packet: &[u8], reply_wait: Duration) -> Result<bool> {
+    fn write_control(&self, label: &str, packet: &[u8]) -> Result<bool> {
         if self.transport.ring_recovery_pending() && !self.transport.is_streaming() {
             anyhow::ensure!(
                 self.transport.hold_allowed(),
@@ -246,11 +246,15 @@ impl H2AioController {
         if self.transport.is_streaming() || self.transport.ring_recovery_pending() {
             return Ok(false);
         }
+        // Replies to SyncPumpFan can arrive after a short wait, and one left in
+        // the pipe was consumed by the next exchange (the constant 105 C
+        // coolant reading). Clear any leftover and wait for this reply in full.
+        transport.read_flush();
         transport
             .write_full(packet, H2_WRITE_TIMEOUT)
             .with_context(|| format!("H2: {label} write"))?;
         let mut buf = [0u8; 512];
-        let _ = transport.read(&mut buf, reply_wait);
+        let _ = transport.read(&mut buf, LCD_READ_TIMEOUT);
         Ok(true)
     }
 
@@ -261,7 +265,7 @@ impl H2AioController {
     fn send_stranded(&self) {
         for cmd in self.transport.take_play_safe() {
             debug!("H2: sending {} stranded by stream teardown", cmd.label);
-            match self.write_control(cmd.label, &cmd.packet, cmd.reply_wait) {
+            match self.write_control(cmd.label, &cmd.packet) {
                 Ok(true) => {}
                 Ok(false) => {
                     // A new stream began before this could go out. Requeue
@@ -366,6 +370,7 @@ impl H2AioController {
                     stream_began = true;
                     None
                 } else {
+                    transport.read_flush();
                     Some(
                         transport
                             .write_full(&hdr, H2_WRITE_TIMEOUT)
@@ -456,8 +461,8 @@ impl H2AioController {
             fan_duties[1],
             fan_duties[2],
         );
-        // Reply wait 250 ms: at 50 ms a slower answer stayed queued and
-        // poisoned the next read.
+        // Reply wait 250 ms for sends from the stream thread: at 50 ms a slower
+        // answer stayed queued and poisoned the next read.
         let sent = self.send_control("SyncPumpFan", header, Duration::from_millis(250), true);
         // A failed write also starts the refresh interval, so an MCU that is
         // refusing writes is not hit on every control tick.
