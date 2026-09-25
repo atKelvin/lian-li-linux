@@ -142,6 +142,7 @@ pub struct H2AioController {
     /// two fields alternated between real data and zeros. One exchange feeds
     /// both within this window.
     params_cache: Mutex<Option<(std::time::Instant, H2Params)>>,
+    params_failed_at: Mutex<Option<std::time::Instant>>,
     /// Last SyncPumpFan attempt: (when, pump duty, fan duties).
     last_sync: Mutex<Option<(std::time::Instant, u8, [u8; 3])>>,
     /// When the "telemetry held back while streaming" line was last logged.
@@ -159,6 +160,7 @@ impl H2AioController {
             is_wireless: AtomicBool::new(false),
             mac: Mutex::new(None),
             params_cache: Mutex::new(None),
+            params_failed_at: Mutex::new(None),
             last_sync: Mutex::new(None),
             stale_params_logged_at: Mutex::new(None),
         };
@@ -293,6 +295,11 @@ impl H2AioController {
     /// Long enough to cover a poll cycle's coolant+RPM pair, far shorter than
     /// the 1s telemetry tick, so readings stay live.
     const PARAMS_CACHE_TTL: Duration = Duration::from_millis(300);
+    /// Each poll asks for coolant, fan RPM and pump RPM separately. After a
+    /// failed exchange these waits keep the three from each blocking the
+    /// service loop on an unresponsive panel or a busy shared transport.
+    const PARAMS_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
+    const PARAMS_LOCK_WAIT: Duration = Duration::from_millis(250);
 
     pub fn get_h2_params(&self) -> Result<H2Params> {
         self.transport.ensure_storage_ready()?;
@@ -318,6 +325,12 @@ impl H2AioController {
             }
             anyhow::bail!("H2: GetH2Params withheld — LCD streaming, no cached reading yet");
         }
+        anyhow::ensure!(
+            self.params_failed_at
+                .lock()
+                .is_none_or(|at| at.elapsed() >= Self::PARAMS_FAILURE_BACKOFF),
+            "H2: GetH2Params backing off after a failed exchange"
+        );
         let header = self.builder.lock().get_h2_params_header_winusb();
 
         // The transport stays locked across both halves of each exchange; it
@@ -328,7 +341,8 @@ impl H2AioController {
         // answer can still be sitting in the pipe. The first exchange then
         // consumes that stale frame and the second gets the real one — which is
         // why coolant read a constant 105 C (a field of the fixed SyncPumpFan
-        // reply) instead of the true ~26 C.
+        // reply) instead of the true ~26 C. A failed transfer is not retried,
+        // it has already spent the full write or read timeout.
         let mut buf = [0u8; 512];
         let mut last_err: Option<anyhow::Error> = None;
         let mut got = false;
@@ -340,7 +354,10 @@ impl H2AioController {
                 self.builder.lock().get_h2_params_header_winusb()
             };
             let res = {
-                let transport = self.transport.lock();
+                let Some(transport) = self.transport.try_lock_for(Self::PARAMS_LOCK_WAIT) else {
+                    last_err = Some(anyhow::anyhow!("H2: GetH2Params skipped, transport busy"));
+                    break;
+                };
                 self.transport.ensure_storage_ready()?;
                 if self.transport.is_streaming() {
                     // Same transition guard as write_control. The earlier
@@ -368,7 +385,10 @@ impl H2AioController {
                     break;
                 }
                 Some(Ok(k)) => last_err = Some(anyhow::anyhow!("response too short ({k} bytes)")),
-                Some(Err(e)) => last_err = Some(e),
+                Some(Err(e)) => {
+                    last_err = Some(e);
+                    break;
+                }
             }
         }
         if stream_began {
@@ -381,6 +401,7 @@ impl H2AioController {
             anyhow::bail!("H2: GetH2Params withheld — LCD streaming began mid exchange");
         }
         if !got {
+            *self.params_failed_at.lock() = Some(std::time::Instant::now());
             return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("H2: GetH2Params failed")));
         }
 

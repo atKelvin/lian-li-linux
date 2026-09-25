@@ -125,6 +125,10 @@ impl LcdLink {
         self.bulk.lock()
     }
 
+    pub fn try_lock_for(&self, timeout: Duration) -> Option<MutexGuard<'_, RusbBulk>> {
+        self.bulk.try_lock_for(timeout)
+    }
+
     pub fn ensure_storage_ready(&self) -> Result<()> {
         anyhow::ensure!(
             !self.storage_interrupted.load(Ordering::Acquire),
