@@ -54,9 +54,9 @@ impl H2WinUsbLcd {
 // buffer (usbmon shows 200 ms+ stalls mid-keyframe). A short timeout makes
 // libusb cancel the URB mid-packet; rusb then reports the partial length and
 // `write_full` resumes from it, which desyncs the firmware and wedges the MCU
-// until power-cycled. This was the last LCD driver still on the pre-split
-// 200 ms constant; 2 s matches base.rs, slv3.rs and hs2_oled.rs.
-const WRITE_TIMEOUT: Duration = Duration::from_millis(2_000);
+// until power-cycled. 2 s matches base.rs, slv3.rs and hs2_oled.rs, and the
+// pump and fan control channel in h2_aio.rs shares it for the same pipe.
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_millis(2_000);
 const READ_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 impl WinUsbLcd for H2WinUsbLcd {

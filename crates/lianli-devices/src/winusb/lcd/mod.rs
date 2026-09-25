@@ -26,6 +26,7 @@ mod slv3;
 mod trait_;
 
 pub use self::core::{LcdLink, PendingCmd, SharedTransport};
+pub(crate) use self::h2_lcd::WRITE_TIMEOUT as H2_WRITE_TIMEOUT;
 use self::trait_::BoxedWinUsbLcd;
 
 pub struct WinUsbLcdDevice(BoxedWinUsbLcd, u16);

@@ -551,6 +551,29 @@ fn buffer_level(response: &[u8]) -> Option<u8> {
     response.get(8).copied()
 }
 
+fn read_reply(bulk: &RusbBulk, timeout: Duration, context: &str) -> Option<LcdResponse> {
+    let mut bytes = [0u8; 512];
+    let response = match bulk.read(&mut bytes, timeout) {
+        Ok(length) if length > 0 => {
+            debug!(
+                "Response for {context} ({length} bytes): {:02x?}",
+                &bytes[..length.min(32)]
+            );
+            Some(LcdResponse { bytes, length })
+        }
+        Ok(_) => {
+            debug!("No response for {context} (timeout)");
+            None
+        }
+        Err(e) => {
+            warn!("Read after {context} failed: {e}");
+            None
+        }
+    };
+    bulk.read_flush();
+    response
+}
+
 pub(crate) struct WinUsbLcdCore {
     pub(crate) h264_transferred: Option<Arc<AtomicBool>>,
     transport: SharedTransport,
@@ -735,20 +758,18 @@ impl WinUsbLcdCore {
         })
     }
 
-    #[inline]
-    fn tx_write_full(
+    /// Write a command and read its reply under one transport guard. The H2
+    /// control channel shares this pipe, so releasing the guard in between
+    /// lets a SyncPumpFan land while the panel is still busy with this
+    /// command, and each side can then consume the other's reply.
+    fn tx_exchange(
         &self,
         data: &[u8],
-    ) -> std::result::Result<(), lianli_transport::TransportError> {
-        self.transport.lock().write_full(data, self.write_timeout)
-    }
-
-    #[inline]
-    fn tx_read(
-        &self,
-        buf: &mut [u8],
-    ) -> std::result::Result<usize, lianli_transport::TransportError> {
-        self.transport.lock().read(buf, self.read_timeout)
+        context: &str,
+    ) -> std::result::Result<Option<LcdResponse>, lianli_transport::TransportError> {
+        let bulk = self.transport.lock();
+        bulk.write_full(data, self.write_timeout)?;
+        Ok(read_reply(&bulk, self.read_timeout, context))
     }
 
     #[inline]
@@ -808,28 +829,11 @@ impl WinUsbLcdCore {
     }
 
     fn read_response(&mut self, context: &str) -> Option<LcdResponse> {
-        let mut buf = [0u8; 512];
-        match self.tx_read(&mut buf) {
-            Ok(n) if n > 0 => {
-                debug!(
-                    "Response for {context} ({n} bytes): {:02x?}",
-                    &buf[..n.min(32)]
-                );
-                self.tx_read_flush();
-                return Some(LcdResponse {
-                    bytes: buf,
-                    length: n,
-                });
-            }
-            Ok(_) => debug!("No response for {context} (timeout)"),
-            Err(e) => warn!("Read after {context} failed: {e}"),
-        }
-        self.tx_read_flush();
-        None
+        read_reply(&self.transport.lock(), self.read_timeout, context)
     }
 
     pub(crate) fn send_command(&mut self, header: Vec<u8>, label: &str) {
-        match self.tx_write_full(&header) {
+        match self.tx_exchange(&header, label) {
             Ok(_) => self.note_write_success(),
             Err(e) => {
                 warn!("{label} write failed: {e}");
@@ -837,14 +841,13 @@ impl WinUsbLcdCore {
                     warn!("{label} recovery skipped: {rec_err}");
                     return;
                 }
-                if let Err(e2) = self.tx_write_full(&header) {
+                if let Err(e2) = self.tx_exchange(&header, label) {
                     warn!("{label} write retry failed: {e2}");
                     return;
                 }
                 self.note_write_success();
             }
         }
-        self.read_response(label);
     }
 
     /// HydroShift II control-channel init: GetVer, frame rate, SyncClock,
@@ -877,11 +880,17 @@ impl WinUsbLcdCore {
 
     pub(crate) fn read_firmware(&mut self) {
         let ver = self.builder.get_ver_header_winusb();
-        match self.tx_write_full(&ver) {
-            Ok(_) => self.note_write_success(),
-            Err(e) => warn!("GetVer write failed: {e}"),
-        }
-        if let Some(resp) = self.read_response("GetVer") {
+        let response = match self.tx_exchange(&ver, "GetVer") {
+            Ok(response) => {
+                self.note_write_success();
+                response
+            }
+            Err(e) => {
+                warn!("GetVer write failed: {e}");
+                None
+            }
+        };
+        if let Some(resp) = response {
             let fw_bytes = resp.get(8..40.min(resp.len())).unwrap_or_default();
             let end = fw_bytes
                 .iter()
@@ -931,14 +940,16 @@ impl WinUsbLcdCore {
 
     pub(crate) fn stop_clock_resp(&mut self) -> Option<LcdResponse> {
         let h = self.builder.stop_clock_header_winusb();
-        match self.tx_write_full(&h) {
-            Ok(_) => self.note_write_success(),
+        match self.tx_exchange(&h, "StopClock") {
+            Ok(response) => {
+                self.note_write_success();
+                response
+            }
             Err(e) => {
                 warn!("StopClock write failed: {e}");
-                return None;
+                None
             }
         }
-        self.read_response("StopClock")
     }
 
     pub(crate) fn clear_jpg_layer(&mut self) {
@@ -960,10 +971,8 @@ impl WinUsbLcdCore {
         let mut packet = vec![0u8; 512 + jpg_buf.len()];
         packet[..512].copy_from_slice(&header);
         packet[512..].copy_from_slice(&jpg_buf);
-        if let Err(e) = self.tx_write_full(&packet) {
+        if let Err(e) = self.tx_exchange(&packet, "ClearJpgLayer") {
             warn!("ClearJpgLayer failed: {e}");
-        } else {
-            self.read_response("ClearJpgLayer");
         }
     }
 
@@ -984,10 +993,8 @@ impl WinUsbLcdCore {
             let mut packet = vec![0u8; 512 + png_buf.len()];
             packet[..512].copy_from_slice(&header);
             packet[512..].copy_from_slice(&png_buf);
-            if let Err(e) = self.tx_write_full(&packet) {
+            if let Err(e) = self.tx_exchange(&packet, "ClearPngLayer") {
                 warn!("ClearPngLayer failed: {e}");
-            } else {
-                self.read_response("ClearPngLayer");
             }
         }
 
@@ -1007,10 +1014,8 @@ impl WinUsbLcdCore {
         let mut packet = vec![0u8; 512 + jpg_buf.len()];
         packet[..512].copy_from_slice(&header);
         packet[512..].copy_from_slice(&jpg_buf);
-        if let Err(e) = self.tx_write_full(&packet) {
+        if let Err(e) = self.tx_exchange(&packet, "ClearJpgLayer") {
             warn!("ClearJpgLayer failed: {e}");
-        } else {
-            self.read_response("ClearJpgLayer");
         }
     }
 
@@ -1034,19 +1039,17 @@ impl WinUsbLcdCore {
         packet[..512].copy_from_slice(&header);
         packet[512..total].copy_from_slice(frame);
 
-        match self.tx_write_full(&packet) {
-            Ok(_) => self.note_write_success(),
+        let resp = match self.tx_exchange(&packet, "frame ack") {
+            Ok(resp) => resp,
             Err(e) => {
                 warn!("Frame write failed: {e}");
                 self.try_recover()
                     .with_context(|| format!("recovering from frame write error: {e}"))?;
-                self.tx_write_full(&packet)
-                    .context("writing LCD frame after recovery")?;
-                self.note_write_success();
+                self.tx_exchange(&packet, "frame ack")
+                    .context("writing LCD frame after recovery")?
             }
-        }
-
-        let resp = self.read_response("frame ack");
+        };
+        self.note_write_success();
         if let Some(level) = resp.as_deref().and_then(buffer_level) {
             if level > 3 {
                 self.wait_buffer(2, None);
@@ -1074,16 +1077,16 @@ impl WinUsbLcdCore {
 
     pub(crate) fn set_brightness_val(&mut self, brightness: u8) -> Result<()> {
         let header = self.builder.brightness_header_winusb(brightness);
-        self.tx_write_full(&header).context("setting brightness")?;
-        self.read_response("brightness");
+        self.tx_exchange(&header, "brightness")
+            .context("setting brightness")?;
         debug!("Set brightness to {}", brightness.min(100));
         Ok(())
     }
 
     pub(crate) fn set_frame_rate(&mut self, fps: u8) -> Result<()> {
         let header = self.builder.frame_rate_header_winusb(fps);
-        self.tx_write_full(&header).context("setting frame rate")?;
-        self.read_response("frame rate");
+        self.tx_exchange(&header, "frame rate")
+            .context("setting frame rate")?;
         debug!("Set frame rate to {fps}");
         Ok(())
     }
@@ -1108,18 +1111,8 @@ impl WinUsbLcdCore {
 
     fn query_buffer_level(&mut self) -> Option<u8> {
         let header = self.builder.query_buffer_level_header_winusb();
-        self.tx_write_full(&header).ok()?;
-        let mut buf = [0u8; 512];
-        match self.tx_read(&mut buf) {
-            Ok(n) if n > 0 => {
-                self.tx_read_flush();
-                buffer_level(&buf[..n])
-            }
-            _ => {
-                self.tx_read_flush();
-                None
-            }
-        }
+        let response = self.tx_exchange(&header, "QueryBlock").ok()??;
+        buffer_level(&response)
     }
 
     /// Poll QueryBlock at the vendor cadence, with a total wait bound.

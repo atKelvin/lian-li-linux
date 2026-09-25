@@ -4,14 +4,14 @@
 //! While the LCD is streaming H.264, control writes are handed to the stream
 //! thread (see `LcdLink`) instead of going straight on the wire.
 
-use super::lcd::{PendingCmd, SharedTransport};
+use super::lcd::{PendingCmd, SharedTransport, H2_WRITE_TIMEOUT};
 use crate::crypto::PacketBuilder;
 use crate::traits::{AioDevice, FanDevice, RgbDevice, RgbFrameDelivery};
 use anyhow::{Context, Result};
 use lianli_shared::rgb::{
     RgbEffect, RgbMode, RgbPlaybackTiming, RgbRenderFamily, RgbRenderProfile, RgbZoneInfo,
 };
-use lianli_transport::usb::{LCD_READ_TIMEOUT, LCD_WRITE_TIMEOUT};
+use lianli_transport::usb::LCD_READ_TIMEOUT;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -118,7 +118,7 @@ fn wake(transport: &SharedTransport) {
             debug!("H2 control channel: wake skipped, LCD streaming");
             return;
         }
-        let _ = t.write(cmd, LCD_WRITE_TIMEOUT);
+        let _ = t.write(cmd, H2_WRITE_TIMEOUT);
         let mut buf = [0u8; 512];
         let _ = t.read(&mut buf, LCD_READ_TIMEOUT);
         drop(t);
@@ -142,7 +142,7 @@ pub struct H2AioController {
     /// two fields alternated between real data and zeros. One exchange feeds
     /// both within this window.
     params_cache: Mutex<Option<(std::time::Instant, H2Params)>>,
-    /// Last SyncPumpFan actually put on the wire: (when, pump duty, fan duties).
+    /// Last SyncPumpFan attempt: (when, pump duty, fan duties).
     last_sync: Mutex<Option<(std::time::Instant, u8, [u8; 3])>>,
     /// When the "telemetry held back while streaming" line was last logged.
     stale_params_logged_at: Mutex<Option<std::time::Instant>>,
@@ -235,7 +235,7 @@ impl H2AioController {
                 "HydroShift II control",
                 &[],
                 &[],
-                LCD_WRITE_TIMEOUT,
+                H2_WRITE_TIMEOUT,
                 false,
             )?;
         }
@@ -245,7 +245,7 @@ impl H2AioController {
             return Ok(false);
         }
         transport
-            .write_full(packet, LCD_WRITE_TIMEOUT)
+            .write_full(packet, H2_WRITE_TIMEOUT)
             .with_context(|| format!("H2: {label} write"))?;
         let mut buf = [0u8; 512];
         let _ = transport.read(&mut buf, reply_wait);
@@ -351,7 +351,7 @@ impl H2AioController {
                 } else {
                     Some(
                         transport
-                            .write_full(&hdr, LCD_WRITE_TIMEOUT)
+                            .write_full(&hdr, H2_WRITE_TIMEOUT)
                             .context("H2: GetH2Params write")
                             .and_then(|_| {
                                 transport
@@ -437,8 +437,11 @@ impl H2AioController {
         );
         // Reply wait 250 ms: at 50 ms a slower answer stayed queued and
         // poisoned the next read.
-        let sent = self.send_control("SyncPumpFan", header, Duration::from_millis(250), true)?;
+        let sent = self.send_control("SyncPumpFan", header, Duration::from_millis(250), true);
+        // A failed write also starts the refresh interval, so an MCU that is
+        // refusing writes is not hit on every control tick.
         *self.last_sync.lock() = Some((std::time::Instant::now(), pump_duty, fan_duties));
+        let sent = sent?;
         debug!(
             "H2: SyncPumpFan pump_pwm={pump_pwm} fans={:?}{}",
             fan_duties,
@@ -561,7 +564,7 @@ impl H2AioController {
                 "HydroShift II control",
                 &[("StopPlay", stop), ("StopClock", stop_clock)],
                 std::slice::from_ref(&cmd),
-                LCD_WRITE_TIMEOUT,
+                H2_WRITE_TIMEOUT,
                 false,
             ) {
                 Ok(pushed) => pushed,
